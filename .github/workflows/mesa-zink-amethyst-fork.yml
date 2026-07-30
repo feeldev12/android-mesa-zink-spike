@@ -45,10 +45,46 @@ jobs:
           git fetch --depth 1 origin "$MESA_FORK_COMMIT"
           git checkout FETCH_HEAD
 
-      - name: Checkout libdrm (real upstream)
+      - name: Checkout libdrm (pinned to the EXACT commit amethyst-prebuilt-libraries uses)
+        # BUGFIX (first real run): a plain shallow clone of libdrm's default
+        # branch tip failed meson configure with "Unknown option: freedreno"
+        # -- current upstream libdrm's meson_options.txt no longer has that
+        # option name. Amethyst's own `drm` submodule is pinned to a specific
+        # older commit (confirmed via `git ls-tree` on their real repo) that
+        # still has it -- use the exact same commit instead of floating on
+        # whatever upstream HEAD currently is.
+        env:
+          LIBDRM_COMMIT: 76a1e97a9a7c29fa3035bb370d654791bdc23d90
         run: |
           set -euo pipefail
-          git clone --depth 1 https://gitlab.freedesktop.org/mesa/libdrm.git drm
+          mkdir drm && cd drm
+          git init -q
+          git remote add origin https://gitlab.freedesktop.org/mesa/libdrm.git
+          git fetch --depth 1 origin "$LIBDRM_COMMIT"
+          git checkout FETCH_HEAD
+
+      - name: Patch zink_kopper.c -- force preTransform=IDENTITY
+        # THE ACTUAL FIX this whole spike exists for: confirmed via a live
+        # on-device Vulkan probe (vkGetPhysicalDeviceSurfaceCapabilitiesKHR)
+        # that this device's currentTransform for a landscape-locked
+        # Activity's SurfaceView is VK_SURFACE_TRANSFORM_ROTATE_90_BIT_KHR
+        # (0x2), NOT IDENTITY -- even though currentExtent already correctly
+        # reports landscape dimensions. Kopper's zink_kopper.c unconditionally
+        # does `cswap->scci.preTransform = cdt->caps.currentTransform;`,
+        # declaring to the compositor "my content is already rotated 90° to
+        # match" -- but Zink never actually pre-rotates anything, so the
+        # compositor "corrects" (i.e. rotates) an already-correct buffer.
+        # Forcing IDENTITY here tells the compositor to trust the buffer
+        # as-is, matching what Zink actually renders. No app-side Android API
+        # (ANativeWindow_setBuffersTransform/setBuffersGeometry, immersive
+        # fullscreen) could influence this -- confirmed empirically on-device
+        # this session -- so this is a genuine Mesa-side fix, not guesswork.
+        run: |
+          set -euo pipefail
+          FILE="mesa/src/gallium/drivers/zink/zink_kopper.c"
+          grep -n "scci.preTransform = cdt->caps.currentTransform;" "$FILE"
+          sed -i 's/cswap->scci\.preTransform = cdt->caps\.currentTransform;/cswap->scci.preTransform = VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR; \/* NERION PATCH: currentTransform is device-intrinsic (ROTATE_90 on this test device) and Zink never pre-rotates to match it, so honoring it makes the compositor rotate an already-correct buffer *\//' "$FILE"
+          grep -n "NERION PATCH" "$FILE"
 
       - name: Install host build dependencies
         run: |
