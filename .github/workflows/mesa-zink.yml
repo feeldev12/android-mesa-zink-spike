@@ -1,0 +1,135 @@
+name: Mesa/Zink Android build (android-stub investigation)
+
+# Standalone spike split out of the private `app-launcher` repo (see
+# https://github.com/feeldev12/app-launcher/blob/main/.github/workflows/android-mesa-zink.yml)
+# purely so CI runs here don't burn that repo's private Actions minutes quota
+# (public repos get unlimited standard-runner minutes). This workflow does
+# NOT depend on anything from that repo -- it only clones Mesa from GitLab
+# and cross-compiles it, so it's fully self-contained.
+#
+# Investigating: on-device testing of the real `app-launcher` build showed
+# the compiled `libEGL.so`/`libgallium_dri.so` have real DT_NEEDED entries on
+# `libcutils.so`/`libhardware.so`/`liblog.so`/`libsync.so`/`libnativewindow.so`,
+# even though the workflow passes `-Dandroid-stub=true`. Per Mesa's own
+# meson.build (mesa-25.3.6, ~line 899-919), `dep_android` (which becomes
+# those DT_NEEDED entries via u_gralloc's meson.build) is ONLY assigned
+# `if not with_android_stub` -- so if the flag were taking effect, none of
+# this should be linked at all, and u_gralloc would fall back to its plain
+# LIBDRM backend (needs only libdrm.so, no Android-platform-private libs).
+# This workflow adds a diagnostic step right after `meson setup` to settle
+# whether `with_android_stub` is really true and whether `dependency('cutils')`
+# /`dependency('hardware')` etc. actually got invoked, before spending time on
+# any other theory.
+
+on:
+  workflow_dispatch:
+
+env:
+  MESA_REF: mesa-25.3.6
+  ANDROID_NDK_VERSION: r29
+  ANDROID_PLATFORM_SDK_VERSION: 34
+
+jobs:
+  build:
+    name: "Build Mesa/Zink for arm64-v8a (diagnostic)"
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout Mesa (pinned release tag, real upstream on GitLab)
+        run: |
+          set -euo pipefail
+          git clone --branch "$MESA_REF" --depth 1 \
+            https://gitlab.freedesktop.org/mesa/mesa.git mesa
+
+      - name: Install host build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get -y install ninja-build python3-mako python3-pip pkg-config unzip bison flex zlib1g-dev ccache
+          pip3 install --user 'meson>=1.5,<2'
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Fetch Android NDK ${{ env.ANDROID_NDK_VERSION }}
+        run: |
+          set -euo pipefail
+          curl -L --retry 4 -f --retry-all-errors --retry-delay 30 \
+            -o "$RUNNER_TEMP/ndk.zip" \
+            "https://dl.google.com/android/repository/android-ndk-${ANDROID_NDK_VERSION}-linux.zip"
+          unzip -q "$RUNNER_TEMP/ndk.zip" -d "$RUNNER_TEMP"
+          echo "NDK_HOME=$RUNNER_TEMP/android-ndk-${ANDROID_NDK_VERSION}" >> "$GITHUB_ENV"
+
+      - name: Generate meson cross-file
+        run: |
+          set -euo pipefail
+          cross_file="$RUNNER_TEMP/cross-aarch64.txt"
+          toolchain_dir="toolchains/llvm/prebuilt/linux-x86_64/bin"
+          cat > "$cross_file" <<EOF
+          [constants]
+          ndk_path = '${NDK_HOME}'
+          toolchain = ndk_path / '${toolchain_dir}'
+
+          [binaries]
+          ar = toolchain / 'llvm-ar'
+          c = ['ccache', toolchain / 'aarch64-linux-android${{ env.ANDROID_PLATFORM_SDK_VERSION }}-clang']
+          cpp = ['ccache', toolchain / 'aarch64-linux-android${{ env.ANDROID_PLATFORM_SDK_VERSION }}-clang++', '-fno-exceptions', '-fno-unwind-tables', '-fno-asynchronous-unwind-tables', '--start-no-unused-arguments', '-static-libstdc++', '--end-no-unused-arguments']
+          c_ld = 'lld'
+          cpp_ld = 'lld'
+          strip = toolchain / 'llvm-strip'
+
+          [host_machine]
+          system = 'android'
+          cpu_family = 'aarch64'
+          cpu = 'armv8'
+          endian = 'little'
+          EOF
+          echo "CROSS_FILE=$cross_file" >> "$GITHUB_ENV"
+
+      - name: Configure Mesa (Zink gallium driver, Android EGL platform, android-stub=true)
+        working-directory: mesa
+        run: |
+          meson setup build \
+            --cross-file "$CROSS_FILE" \
+            --prefix "$GITHUB_WORKSPACE/mesa/install" \
+            --buildtype release \
+            -Dplatforms=android \
+            -Dplatform-sdk-version=${{ env.ANDROID_PLATFORM_SDK_VERSION }} \
+            -Dandroid-stub=true \
+            -Dandroid-libbacktrace=disabled \
+            -Degl=enabled \
+            -Dgallium-drivers=zink \
+            -Dvulkan-drivers= \
+            -Dallow-fallback-for=libdrm
+
+      - name: DIAGNOSTIC -- was android-stub actually honored?
+        working-directory: mesa
+        run: |
+          set -x
+          echo "=== meson's own recorded value of android-stub ==="
+          meson configure build | grep -i android-stub || true
+          echo "=== did meson actually invoke dependency('cutils')/('hardware')/('log')/('sync')/('nativewindow')? ==="
+          grep -n -i "Dependency cutils\|Dependency hardware\|Dependency log \|Dependency sync\|Dependency nativewindow\|Run-time dependency cutils\|Run-time dependency hardware\|Run-time dependency log\|Run-time dependency sync\|Run-time dependency nativewindow" build/meson-logs/meson-log.txt || echo "(no matches -- dependency() calls for these were never made, android-stub gate worked as expected)"
+          echo "=== full android-related config summary ==="
+          grep -n -i "android" build/meson-logs/meson-log.txt | head -80
+
+      - name: Build and install
+        working-directory: mesa
+        run: ninja -C build install
+
+      - name: DIAGNOSTIC -- actual DT_NEEDED of the built libEGL.so
+        run: |
+          sudo apt-get -y install binutils
+          echo "=== libEGL.so NEEDED entries ==="
+          aarch64-linux-gnu-readelf --dynamic mesa/install/lib/libEGL.so 2>/dev/null | grep NEEDED || \
+            readelf --dynamic mesa/install/lib/libEGL.so | grep NEEDED
+
+      - name: Package jniLibs layout
+        run: |
+          set -euo pipefail
+          out="jniLibs/arm64-v8a"
+          mkdir -p "$out"
+          find mesa/install/lib -maxdepth 1 -name '*.so' -exec cp -v {} "$out/" \;
+          ls -la "$out"
+
+      - name: Upload jniLibs artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: "mesa-zink-arm64-v8a"
+          path: jniLibs/arm64-v8a
