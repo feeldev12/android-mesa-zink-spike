@@ -1,0 +1,178 @@
+name: Mesa/Zink (Amethyst-Android's exact fork+flags, arm64 only)
+
+# Second spike: instead of vanilla upstream Mesa (mesa-zink.yml in this same
+# repo, which confirmed `-Dandroid-stub=true` does NOT prevent libEGL.so from
+# needing libcutils.so/libhardware.so/liblog.so/libsync.so/libnativewindow.so
+# -- those come from an UNCONDITIONAL `deps_for_egl += dep_android` in
+# src/egl/meson.build, not gated the way u_gralloc's own backend selection
+# is), this replicates AngelAuraMC/amethyst-prebuilt-libraries's ACTUAL
+# working Zink+Kopper recipe as closely as possible:
+#   - Mesa fork: gitlab.freedesktop.org/Swung0x48/mesa.git (the Kopper
+#     author's own fork), pinned to the exact commit their repo's
+#     `mesa-kopper` submodule points at (9ea0decb3176d34e578c3c603fd9c8e29b580f71,
+#     Mesa 23.0.4-based -- older than vanilla mesa-25.3.6, predates the
+#     `u_gralloc` abstraction entirely).
+#   - Same meson flags their `build_zink_builddirs.sh` uses:
+#     `-Degl-lib-suffix=_mesa` (their libEGL is literally named
+#     `libEGL_mesa.so`, not `libEGL.so`), `-Dgbm=disabled`, `-Dglx=disabled`,
+#     `-Dllvm=disabled`, `-Dopengl=true`, `-Dglvnd=false`, `-Dzstd=disabled`,
+#     `-Dxlib-lease=disabled`, `-Dplatform-sdk-version=30` (we used 34).
+#   - Static libdrm (their `build_libdrm-static_builddirs.sh`), not meson's
+#     `-Dallow-fallback-for` auto-subproject.
+# Same diagnostic steps as the other workflow: confirm whether
+# `dependency('hardware')`/`dependency('cutils')` etc. actually got invoked,
+# and dump the final `libEGL_mesa.so`'s real DT_NEEDED list.
+
+on:
+  workflow_dispatch:
+
+env:
+  MESA_FORK_COMMIT: 9ea0decb3176d34e578c3c603fd9c8e29b580f71
+  ANDROID_NDK_VERSION: r29
+  SDK_VER: 30
+
+jobs:
+  build:
+    name: "Build Mesa/Zink (Amethyst fork) for arm64-v8a"
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout Mesa fork (Swung0x48's Kopper fork, pinned commit)
+        run: |
+          set -euo pipefail
+          mkdir mesa && cd mesa
+          git init -q
+          git remote add origin https://gitlab.freedesktop.org/Swung0x48/mesa.git
+          git fetch --depth 1 origin "$MESA_FORK_COMMIT"
+          git checkout FETCH_HEAD
+
+      - name: Checkout libdrm (real upstream)
+        run: |
+          set -euo pipefail
+          git clone --depth 1 https://gitlab.freedesktop.org/mesa/libdrm.git drm
+
+      - name: Install host build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get -y install ninja-build python3-mako python3-pip pkg-config unzip bison flex zlib1g-dev ccache
+          pip3 install --user 'meson>=1.5,<2'
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Fetch Android NDK ${{ env.ANDROID_NDK_VERSION }}
+        run: |
+          set -euo pipefail
+          curl -L --retry 4 -f --retry-all-errors --retry-delay 30 \
+            -o "$RUNNER_TEMP/ndk.zip" \
+            "https://dl.google.com/android/repository/android-ndk-${ANDROID_NDK_VERSION}-linux.zip"
+          unzip -q "$RUNNER_TEMP/ndk.zip" -d "$RUNNER_TEMP"
+          echo "NDK_HOME=$RUNNER_TEMP/android-ndk-${ANDROID_NDK_VERSION}" >> "$GITHUB_ENV"
+
+      - name: Generate libdrm cross-file (aarch64 only, matches Amethyst's generator)
+        run: |
+          set -euo pipefail
+          cat > "$RUNNER_TEMP/libdrm-crossfile-aarch64-android" <<EOF
+          [binaries]
+          ndk_root = '${NDK_HOME}'
+          sdk_ver = '${{ env.SDK_VER }}'
+          ndk = ndk_root / 'toolchains/llvm/prebuilt/linux-x86_64/bin'
+          sysroot = ndk_root / 'toolchains/llvm/prebuilt/linux-x86_64/sysroot'
+          ar = ndk / 'llvm-ar'
+          c = ['ccache', ndk / ('aarch64-linux-android' + sdk_ver + '-clang'), '-O3', '-DVK_USE_PLATFORM_ANDROID_KHR', '-fPIC', '--sysroot=' + sysroot]
+          cpp = ['ccache', ndk / ('aarch64-linux-android' + sdk_ver + '-clang++'), '-O3', '-DVK_USE_PLATFORM_ANDROID_KHR', '-fPIC', '-fno-exceptions', '-fno-unwind-tables', '-fno-asynchronous-unwind-tables', '-static-libstdc++', '--sysroot=' + sysroot, '-static', '-ffunction-sections', '-fdata-sections', '-Wl,--gc-sections']
+          strip = ndk / 'llvm-strip'
+          pkgconfig = ['pkg-config']
+
+          [host_machine]
+          system = 'android'
+          cpu_family = 'aarch64'
+          cpu = 'armv8'
+          endian = 'little'
+          EOF
+
+      - name: Build static libdrm (aarch64)
+        run: |
+          set -euo pipefail
+          meson setup drm build-libdrm-aarch64-android \
+            --prefix="$PWD/libdrm_install/drm-static-aarch64-android" \
+            --cross-file "$RUNNER_TEMP/libdrm-crossfile-aarch64-android" \
+            -Ddefault_library=static \
+            -Dintel=disabled -Dradeon=disabled -Damdgpu=disabled -Dnouveau=disabled \
+            -Dvmwgfx=disabled -Dfreedreno=disabled -Dvc4=disabled -Detnaviv=disabled \
+            -Dcairo-tests=disabled -Dfreedreno-kgsl=false
+          ninja -C build-libdrm-aarch64-android install
+
+      - name: Generate Mesa cross-file (aarch64 only, matches Amethyst's generator)
+        run: |
+          set -euo pipefail
+          LIBDRM_DIR="$PWD/libdrm_install/drm-static-aarch64-android"
+          cat > "$RUNNER_TEMP/mesa-crossfile-aarch64-android" <<EOF
+          [binaries]
+          ndk_root = '${NDK_HOME}'
+          sdk_ver = '${{ env.SDK_VER }}'
+          ndk = ndk_root / 'toolchains/llvm/prebuilt/linux-x86_64/bin'
+          sysroot = ndk_root / 'toolchains/llvm/prebuilt/linux-x86_64/sysroot'
+          libdrm_install_dir = '${LIBDRM_DIR}'
+          ar = ndk / 'llvm-ar'
+          c = ['ccache', ndk / ('aarch64-linux-android' + sdk_ver + '-clang'), '-O3', '-DVK_USE_PLATFORM_ANDROID_KHR', '-fPIC', '--sysroot=' + sysroot, '-ffunction-sections', '-fdata-sections', '-D_POSIX_SOURCE']
+          cpp = ['ccache', ndk / ('aarch64-linux-android' + sdk_ver + '-clang++'), '-O3', '-DVK_USE_PLATFORM_ANDROID_KHR', '-fPIC', '-fno-exceptions', '-fno-unwind-tables', '-fno-asynchronous-unwind-tables', '-static-libstdc++', '--sysroot=' + sysroot, '-ffunction-sections', '-fdata-sections', '-D_POSIX_SOURCE']
+          strip = ndk / 'llvm-strip'
+          pkgconfig = ['env', 'PKG_CONFIG_LIBDIR=' + libdrm_install_dir + '/lib/pkgconfig', 'pkg-config']
+
+          [host_machine]
+          system = 'android'
+          cpu_family = 'aarch64'
+          cpu = 'armv8'
+          endian = 'little'
+          EOF
+
+      - name: Configure Mesa (Amethyst's exact flags)
+        run: |
+          meson setup mesa build-mesa-aarch64-android \
+            --prefix="$PWD/mesa_install/aarch64" \
+            --cross-file "$RUNNER_TEMP/mesa-crossfile-aarch64-android" \
+            -Dplatforms=android \
+            -Dplatform-sdk-version=${{ env.SDK_VER }} \
+            -Dandroid-stub=true \
+            -Dxlib-lease=disabled \
+            -Degl=enabled \
+            -Dgbm=disabled \
+            -Dglx=disabled \
+            -Dllvm=disabled \
+            -Dopengl=true \
+            -Dvulkan-drivers= \
+            -Dgallium-drivers=zink \
+            -Dzstd=disabled \
+            -Dglvnd=false \
+            -Degl-lib-suffix=_mesa \
+            -Dbuildtype=release
+
+      - name: DIAGNOSTIC -- was android-stub actually honored this time?
+        run: |
+          set -x
+          echo "=== meson's own recorded value of android-stub ==="
+          meson configure build-mesa-aarch64-android | grep -i android-stub || true
+          echo "=== did meson actually invoke dependency('cutils')/('hardware')/etc? ==="
+          grep -n -i "Dependency cutils\|Dependency hardware\|Run-time dependency cutils\|Run-time dependency hardware" build-mesa-aarch64-android/meson-logs/meson-log.txt || echo "(no matches -- android-stub gate worked)"
+
+      - name: Build and install
+        run: ninja -C build-mesa-aarch64-android install
+
+      - name: DIAGNOSTIC -- actual DT_NEEDED of the built libEGL_mesa.so
+        run: |
+          set -x
+          find mesa_install/aarch64/lib -maxdepth 1 -name '*.so' -exec ls -la {} \;
+          echo "=== libEGL_mesa.so NEEDED entries ==="
+          readelf --dynamic mesa_install/aarch64/lib/libEGL_mesa.so | grep NEEDED
+
+      - name: Package jniLibs layout
+        run: |
+          set -euo pipefail
+          out="jniLibs/arm64-v8a"
+          mkdir -p "$out"
+          find mesa_install/aarch64/lib -maxdepth 1 -name '*.so' -exec cp -v {} "$out/" \;
+          ls -la "$out"
+
+      - name: Upload jniLibs artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: "mesa-zink-amethyst-fork-arm64-v8a"
+          path: jniLibs/arm64-v8a
