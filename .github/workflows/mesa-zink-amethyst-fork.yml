@@ -200,11 +200,20 @@ jobs:
           readelf --dynamic mesa_install/aarch64/lib/libEGL_mesa.so | grep NEEDED
 
       - name: Package jniLibs layout
+        # BUGFIX (first real run): `-maxdepth 1` never descended into
+        # `lib/dri/`, where `install_megadrivers.py` actually installs the
+        # real gallium/Zink driver as `zink_dri.so` (real DT_SONAME
+        # `libgallium_dri.so`) -- meaning the ACTUAL patched file (our fix is
+        # in `zink_kopper.c`, part of this driver, NOT `libEGL_mesa.so`) was
+        # silently missing from every artifact this workflow uploaded before
+        # this fix. Confirmed via this run's own build log
+        # ("installing .../libgallium_dri.so to .../lib/dri/zink_dri.so").
         run: |
           set -euo pipefail
           out="jniLibs/arm64-v8a"
           mkdir -p "$out"
           find mesa_install/aarch64/lib -maxdepth 1 -name '*.so' -exec cp -v {} "$out/" \;
+          find mesa_install/aarch64/lib/dri -name '*.so' -exec cp -v {} "$out/libzink_dri.so" \;
           ls -la "$out"
 
       - name: Upload jniLibs artifact
